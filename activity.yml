@@ -1,0 +1,971 @@
+import os
+import json
+import requests
+from datetime import datetime, timedelta
+from github import Github
+import schedule
+import time
+import feedparser
+import random
+
+class GitHubActivityBot:
+    """
+    Advanced GitHub activity automation with arXiv, Kaggle, and project templates
+    """
+    
+    def __init__(self, github_token, kaggle_username=None, kaggle_key=None,
+                 topics=['machine-learning', 'deep-learning', 'generative-ai', 
+                        'data-science', 'llm', 'transformers']):
+        self.gh = Github(github_token)
+        self.user = self.gh.get_user()
+        self.topics = topics
+        self.kaggle_username = kaggle_username
+        self.kaggle_key = kaggle_key
+        
+    def find_trending_repos(self, min_stars=100, max_results=10):
+        """Find trending repos in ML/AI space"""
+        query_parts = [f"topic:{topic}" for topic in self.topics]
+        query = " OR ".join(query_parts)
+        query += f" stars:>{min_stars} pushed:>{datetime.now() - timedelta(days=30):%Y-%m-%d}"
+        
+        repos = self.gh.search_repositories(query=query, sort='stars', order='desc')
+        
+        results = []
+        for repo in repos[:max_results]:
+            results.append({
+                'name': repo.full_name,
+                'url': repo.html_url,
+                'stars': repo.stargazers_count,
+                'description': repo.description,
+                'language': repo.language
+            })
+        return results
+    
+    def fetch_arxiv_papers(self, query='machine learning OR deep learning', max_results=5):
+        """Fetch latest arXiv papers in ML/AI"""
+        base_url = 'http://export.arxiv.org/api/query?'
+        search_query = f"search_query=all:{query}&sortBy=submittedDate&sortOrder=descending&max_results={max_results}"
+        
+        try:
+            response = requests.get(base_url + search_query)
+            feed = feedparser.parse(response.content)
+            
+            papers = []
+            for entry in feed.entries:
+                papers.append({
+                    'title': entry.title,
+                    'authors': [author.name for author in entry.authors],
+                    'summary': entry.summary,
+                    'published': entry.published,
+                    'link': entry.link,
+                    'id': entry.id.split('/abs/')[-1]
+                })
+            return papers
+        except Exception as e:
+            print(f"Error fetching arXiv papers: {e}")
+            return []
+    
+    def create_arxiv_reading_list(self, repo_name='arxiv-reading-list'):
+        """Create/update arXiv paper reading list repo"""
+        try:
+            repo = self.user.get_repo(repo_name)
+        except:
+            repo = self.user.create_repo(
+                name=repo_name,
+                description="Curated list of ML/AI papers from arXiv with notes",
+                auto_init=True
+            )
+            
+        papers = self.fetch_arxiv_papers(max_results=5)
+        
+        today = datetime.now().strftime('%Y-%m-%d')
+        year_month = datetime.now().strftime('%Y-%m')
+        file_path = f"papers/{year_month}/{today}.md"
+        
+        content = f"""# arXiv Papers - {today}
+
+## Papers of Interest
+
+"""
+        
+        for i, paper in enumerate(papers, 1):
+            authors_str = ", ".join(paper['authors'][:3])
+            if len(paper['authors']) > 3:
+                authors_str += " et al."
+                
+            content += f"""### {i}. {paper['title']}
+
+**Authors:** {authors_str}  
+**Published:** {paper['published'][:10]}  
+**arXiv ID:** {paper['id']}  
+**Link:** {paper['link']}
+
+**Abstract (excerpt):**  
+{paper['summary'][:300]}...
+
+**My Notes:**
+- Key contribution:
+- Relevance to my work:
+- Implementation ideas:
+
+**Status:** 📚 To Read
+
+---
+
+"""
+        
+        content += f"""
+## Reading Progress
+- Total papers tracked: {len(papers)}
+- Papers read this month: 0
+- Implementation attempts: 0
+
+## Tags
+#machine-learning #deep-learning #research
+"""
+        
+        try:
+            repo.create_file(file_path, f"arXiv papers: {today}", content)
+            print(f"✅ Created arXiv reading list for {today}")
+            
+            # Update main README
+            self._update_arxiv_readme(repo, papers)
+        except Exception as e:
+            print(f"Error creating arXiv list: {e}")
+    
+    def _update_arxiv_readme(self, repo, latest_papers):
+        """Update main README with latest papers"""
+        readme_content = f"""# arXiv Reading List
+
+Personal collection of ML/AI papers with implementation notes.
+
+## Latest Papers ({datetime.now().strftime('%Y-%m-%d')})
+
+"""
+        for i, paper in enumerate(latest_papers[:3], 1):
+            readme_content += f"{i}. [{paper['title']}]({paper['link']}) - {paper['published'][:10]}\n"
+        
+        readme_content += """
+
+## Organization
+- Papers organized by month in `/papers/YYYY-MM/` folders
+- Each paper includes notes, implementation ideas, and reading status
+
+## Legend
+- 📚 To Read
+- 📖 Reading
+- ✅ Completed
+- 💻 Implemented
+
+"""
+        
+        try:
+            readme = repo.get_contents("README.md")
+            repo.update_file("README.md", "Update with latest papers", 
+                           readme_content, readme.sha)
+        except:
+            repo.create_file("README.md", "Initial README", readme_content)
+    
+    def fetch_kaggle_datasets(self, search_term='machine learning'):
+        """Fetch trending Kaggle datasets"""
+        if not self.kaggle_username or not self.kaggle_key:
+            print("Kaggle credentials not provided")
+            return []
+        
+        try:
+            # Note: Requires kaggle package and authentication
+            from kaggle.api.kaggle_api_extended import KaggleApi
+            api = KaggleApi()
+            api.authenticate()
+            
+            datasets = api.dataset_list(search=search_term, sort_by='hottest', page=1)
+            
+            results = []
+            for ds in datasets[:5]:
+                results.append({
+                    'ref': ds.ref,
+                    'title': ds.title,
+                    'size': ds.size,
+                    'url': f"https://www.kaggle.com/datasets/{ds.ref}",
+                    'votes': ds.voteCount
+                })
+            return results
+        except Exception as e:
+            print(f"Error fetching Kaggle datasets: {e}")
+            return []
+    
+    def create_kaggle_project_template(self, dataset_name, project_type='analysis'):
+        """Create project repo from Kaggle dataset with full template"""
+        safe_name = dataset_name.lower().replace(' ', '-').replace('/', '-')
+        repo_name = f"kaggle-{safe_name}"
+        
+        templates = {
+            'analysis': {
+                'description': f'Exploratory Data Analysis of {dataset_name}',
+                'structure': {
+                    'notebooks/01_data_exploration.ipynb': '# Data Exploration\n',
+                    'notebooks/02_preprocessing.ipynb': '# Data Preprocessing\n',
+                    'notebooks/03_visualization.ipynb': '# Data Visualization\n',
+                    'notebooks/04_modeling.ipynb': '# Model Building\n',
+                    'src/data_loader.py': self._get_data_loader_template(),
+                    'src/preprocessing.py': self._get_preprocessing_template(),
+                    'src/visualization.py': self._get_visualization_template(),
+                    'src/utils.py': self._get_utils_template(),
+                }
+            },
+            'competition': {
+                'description': f'Kaggle Competition: {dataset_name}',
+                'structure': {
+                    'notebooks/baseline_model.ipynb': '# Baseline Model\n',
+                    'src/models.py': self._get_models_template(),
+                    'src/training.py': self._get_training_template(),
+                    'src/evaluation.py': self._get_evaluation_template(),
+                }
+            }
+        }
+        
+        template = templates.get(project_type, templates['analysis'])
+        
+        try:
+            repo = self.user.create_repo(
+                name=repo_name,
+                description=template['description'],
+                auto_init=True
+            )
+            
+            # Create README
+            readme = self._get_kaggle_readme_template(dataset_name)
+            repo.create_file("README.md", "Initial README", readme)
+            
+            # Create requirements.txt
+            requirements = """pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+jupyter>=1.0.0
+plotly>=5.14.0
+xgboost>=1.7.0
+lightgbm>=3.3.0
+optuna>=3.1.0
+"""
+            repo.create_file("requirements.txt", "Add requirements", requirements)
+            
+            # Create .gitignore
+            gitignore = """*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+data/
+*.csv
+*.pkl
+*.h5
+*.pth
+models/
+logs/
+.env
+"""
+            repo.create_file(".gitignore", "Add gitignore", gitignore)
+            
+            # Create directory structure
+            for path, content in template['structure'].items():
+                repo.create_file(path, f"Add {path}", content)
+            
+            print(f"✅ Created Kaggle project: {repo_name}")
+            return repo
+        except Exception as e:
+            print(f"Error creating Kaggle project: {e}")
+            return None
+    
+    def _get_data_loader_template(self):
+        return '''"""Data loading utilities"""
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+class DataLoader:
+    def __init__(self, data_path):
+        self.data_path = Path(data_path)
+    
+    def load_data(self):
+        """Load dataset from CSV"""
+        return pd.read_csv(self.data_path)
+    
+    def get_train_test_split(self, test_size=0.2, random_state=42):
+        """Split data into train and test sets"""
+        from sklearn.model_selection import train_test_split
+        df = self.load_data()
+        # Implement split logic
+        return train_test_split(df, test_size=test_size, random_state=random_state)
+'''
+    
+    def _get_preprocessing_template(self):
+        return '''"""Data preprocessing pipeline"""
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+class Preprocessor:
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.encoders = {}
+    
+    def handle_missing_values(self, df):
+        """Handle missing values"""
+        # Implement missing value strategy
+        return df
+    
+    def encode_categorical(self, df, columns):
+        """Encode categorical variables"""
+        for col in columns:
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col])
+            self.encoders[col] = le
+        return df
+    
+    def scale_features(self, X):
+        """Scale numerical features"""
+        return self.scaler.fit_transform(X)
+'''
+    
+    def _get_visualization_template(self):
+        return '''"""Visualization utilities"""
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+
+class Visualizer:
+    def __init__(self, style='seaborn'):
+        plt.style.use(style)
+    
+    def plot_distribution(self, df, column):
+        """Plot distribution of a column"""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.histplot(data=df, x=column, kde=True, ax=ax)
+        plt.title(f'Distribution of {column}')
+        return fig
+    
+    def plot_correlation_matrix(self, df):
+        """Plot correlation heatmap"""
+        fig, ax = plt.subplots(figsize=(12, 10))
+        sns.heatmap(df.corr(), annot=True, fmt='.2f', cmap='coolwarm', ax=ax)
+        plt.title('Feature Correlation Matrix')
+        return fig
+'''
+    
+    def _get_utils_template(self):
+        return '''"""Utility functions"""
+import json
+import pickle
+from pathlib import Path
+
+def save_model(model, filepath):
+    """Save model to disk"""
+    with open(filepath, 'wb') as f:
+        pickle.dump(model, f)
+
+def load_model(filepath):
+    """Load model from disk"""
+    with open(filepath, 'rb') as f:
+        return pickle.load(f)
+
+def save_metrics(metrics, filepath):
+    """Save metrics to JSON"""
+    with open(filepath, 'w') as f:
+        json.dump(metrics, f, indent=4)
+'''
+    
+    def _get_models_template(self):
+        return '''"""Model definitions"""
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
+import lightgbm as lgb
+
+def get_baseline_models():
+    """Return dictionary of baseline models"""
+    return {
+        'logistic': LogisticRegression(max_iter=1000),
+        'rf': RandomForestClassifier(n_estimators=100, random_state=42),
+        'gbm': GradientBoostingClassifier(n_estimators=100, random_state=42),
+        'xgb': xgb.XGBClassifier(n_estimators=100, random_state=42),
+        'lgb': lgb.LGBMClassifier(n_estimators=100, random_state=42)
+    }
+'''
+    
+    def _get_training_template(self):
+        return '''"""Model training pipeline"""
+from sklearn.model_selection import cross_val_score
+import numpy as np
+
+class Trainer:
+    def __init__(self, model, cv=5):
+        self.model = model
+        self.cv = cv
+    
+    def train(self, X_train, y_train):
+        """Train model"""
+        self.model.fit(X_train, y_train)
+        return self.model
+    
+    def cross_validate(self, X, y, scoring='accuracy'):
+        """Perform cross-validation"""
+        scores = cross_val_score(self.model, X, y, cv=self.cv, scoring=scoring)
+        return {
+            'mean': np.mean(scores),
+            'std': np.std(scores),
+            'scores': scores
+        }
+'''
+    
+    def _get_evaluation_template(self):
+        return '''"""Model evaluation utilities"""
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, classification_report
+
+class Evaluator:
+    def evaluate(self, y_true, y_pred):
+        """Comprehensive evaluation"""
+        return {
+            'accuracy': accuracy_score(y_true, y_pred),
+            'precision': precision_score(y_true, y_pred, average='weighted'),
+            'recall': recall_score(y_true, y_pred, average='weighted'),
+            'f1': f1_score(y_true, y_pred, average='weighted')
+        }
+    
+    def get_confusion_matrix(self, y_true, y_pred):
+        """Get confusion matrix"""
+        return confusion_matrix(y_true, y_pred)
+    
+    def get_classification_report(self, y_true, y_pred):
+        """Get detailed classification report"""
+        return classification_report(y_true, y_pred)
+'''
+    
+    def _get_kaggle_readme_template(self, dataset_name):
+        return f"""# Kaggle Project: {dataset_name}
+
+## 📊 Project Overview
+Comprehensive analysis and modeling for the {dataset_name} dataset.
+
+## 🎯 Objectives
+- Exploratory Data Analysis
+- Feature Engineering
+- Model Development
+- Performance Optimization
+
+## 📁 Project Structure
+```
+├── notebooks/           # Jupyter notebooks
+├── src/                # Source code
+│   ├── data_loader.py
+│   ├── preprocessing.py
+│   ├── visualization.py
+│   └── utils.py
+├── data/               # Dataset (gitignored)
+├── models/             # Saved models (gitignored)
+└── requirements.txt
+```
+
+## 🚀 Getting Started
+
+### Installation
+```bash
+pip install -r requirements.txt
+```
+
+### Usage
+```python
+from src.data_loader import DataLoader
+from src.preprocessing import Preprocessor
+
+# Load data
+loader = DataLoader('data/dataset.csv')
+df = loader.load_data()
+
+# Preprocess
+preprocessor = Preprocessor()
+df_clean = preprocessor.handle_missing_values(df)
+```
+
+## 📈 Results
+- Baseline accuracy: TBD
+- Best model: TBD
+- Key insights: TBD
+
+## 🔄 Progress
+- [x] Project setup
+- [ ] Data exploration
+- [ ] Feature engineering
+- [ ] Model training
+- [ ] Hyperparameter tuning
+- [ ] Final submission
+
+## 📝 Notes
+Document key findings and decisions here.
+
+---
+*Last updated: {datetime.now().strftime('%Y-%m-%d')}*
+"""
+    
+    def create_ml_project_from_template(self, project_name, template_type='research'):
+        """Create ML project with industry-standard structure"""
+        templates = {
+            'research': 'Research paper implementation',
+            'deployment': 'Production ML pipeline',
+            'experiment': 'ML experimentation framework',
+            'tutorial': 'Educational ML tutorial'
+        }
+        
+        description = templates.get(template_type, 'ML project')
+        
+        try:
+            repo = self.user.create_repo(
+                name=project_name,
+                description=description,
+                auto_init=True
+            )
+            
+            # Create comprehensive structure
+            structure = {
+                'README.md': self._get_ml_project_readme(project_name, template_type),
+                'requirements.txt': self._get_ml_requirements(),
+                'setup.py': self._get_setup_py(project_name),
+                '.gitignore': self._get_comprehensive_gitignore(),
+                'Makefile': self._get_makefile(),
+                'src/__init__.py': '',
+                'src/data/__init__.py': '',
+                'src/models/__init__.py': '',
+                'src/features/__init__.py': '',
+                'src/visualization/__init__.py': '',
+                'tests/__init__.py': '',
+                'tests/test_data.py': '# Add tests here\n',
+                'notebooks/.gitkeep': '',
+                'data/raw/.gitkeep': '',
+                'data/processed/.gitkeep': '',
+                'models/.gitkeep': '',
+                'reports/.gitkeep': '',
+                'configs/config.yaml': self._get_config_template(),
+                'docker/Dockerfile': self._get_dockerfile(),
+                '.github/workflows/tests.yml': self._get_ci_template(),
+            }
+            
+            for path, content in structure.items():
+                try:
+                    repo.create_file(path, f"Add {path}", content)
+                except:
+                    pass  # Skip if file exists
+            
+            print(f"✅ Created ML project: {project_name}")
+            return repo
+        except Exception as e:
+            print(f"Error creating ML project: {e}")
+            return None
+    
+    def _get_ml_project_readme(self, name, template_type):
+        return f"""# {name}
+
+## Overview
+{template_type.capitalize()} project for machine learning development.
+
+## Project Structure
+```
+├── src/                # Source code
+│   ├── data/          # Data loading and processing
+│   ├── models/        # Model definitions
+│   ├── features/      # Feature engineering
+│   └── visualization/ # Plotting utilities
+├── notebooks/         # Jupyter notebooks
+├── tests/            # Unit tests
+├── data/             # Data directory (gitignored)
+├── models/           # Saved models (gitignored)
+├── reports/          # Generated reports
+├── configs/          # Configuration files
+└── docker/           # Docker configuration
+
+```
+
+## Setup
+
+### Using pip
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+### Using Make
+```bash
+make install
+make test
+```
+
+### Using Docker
+```bash
+docker build -t {name} -f docker/Dockerfile .
+docker run -it {name}
+```
+
+## Usage
+```python
+from src.models import YourModel
+
+model = YourModel()
+model.train(X_train, y_train)
+predictions = model.predict(X_test)
+```
+
+## Development
+```bash
+# Run tests
+make test
+
+# Format code
+make format
+
+# Lint code
+make lint
+```
+
+## Results
+Document your results here.
+
+## License
+MIT License
+"""
+    
+    def _get_ml_requirements(self):
+        return """# Core
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# Deep Learning
+torch>=2.0.0
+tensorflow>=2.13.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Utilities
+jupyter>=1.0.0
+ipython>=8.12.0
+tqdm>=4.65.0
+pyyaml>=6.0
+
+# ML Tools
+optuna>=3.1.0
+mlflow>=2.3.0
+wandb>=0.15.0
+
+# Development
+pytest>=7.3.0
+black>=23.3.0
+flake8>=6.0.0
+mypy>=1.3.0
+"""
+    
+    def _get_setup_py(self, name):
+        return f"""from setuptools import setup, find_packages
+
+setup(
+    name="{name}",
+    version="0.1.0",
+    packages=find_packages(),
+    install_requires=[
+        "numpy>=1.24.0",
+        "pandas>=2.0.0",
+        "scikit-learn>=1.3.0",
+    ],
+    python_requires=">=3.8",
+)
+"""
+    
+    def _get_comprehensive_gitignore(self):
+        return """# Python
+*.py[cod]
+__pycache__/
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data
+data/
+*.csv
+*.parquet
+*.pkl
+*.h5
+*.hdf5
+
+# Models
+models/
+*.pth
+*.pt
+*.ckpt
+*.pb
+
+# Logs
+logs/
+*.log
+wandb/
+mlruns/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+"""
+    
+    def _get_makefile(self):
+        return """install:
+\tpip install -r requirements.txt
+\tpip install -e .
+
+test:
+\tpytest tests/
+
+format:
+\tblack src/ tests/
+\tisort src/ tests/
+
+lint:
+\tflake8 src/ tests/
+\tmypy src/
+
+clean:
+\tfind . -type d -name __pycache__ -exec rm -rf {} +
+\tfind . -type f -name "*.pyc" -delete
+
+.PHONY: install test format lint clean
+"""
+    
+    def _get_config_template(self):
+        return """# Model Configuration
+model:
+  type: "neural_network"
+  hidden_layers: [128, 64, 32]
+  dropout: 0.3
+  activation: "relu"
+
+# Training Configuration
+training:
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  optimizer: "adam"
+
+# Data Configuration
+data:
+  train_path: "data/processed/train.csv"
+  test_path: "data/processed/test.csv"
+  validation_split: 0.2
+"""
+    
+    def _get_dockerfile(self):
+        return """FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "src/main.py"]
+"""
+    
+    def _get_ci_template(self):
+        return """name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pytest
+    - name: Run tests
+      run: pytest tests/
+"""
+    
+    def create_daily_learning_commit(self, repo_name='daily-ml-learning'):
+        """Enhanced daily learning journal with paper summaries"""
+        try:
+            repo = self.user.get_repo(repo_name)
+        except:
+            repo = self.user.create_repo(
+                name=repo_name,
+                description="Daily ML/AI learning journal with paper summaries and code snippets",
+                auto_init=True
+            )
+        
+        today = datetime.now().strftime('%Y-%m-%d')
+        file_path = f"journal/{today}.md"
+        
+        # Fetch a random paper for today's learning
+        papers = self.fetch_arxiv_papers(max_results=1)
+        paper_section = ""
+        if papers:
+            paper = papers[0]
+            paper_section = f"""
+## 📄 Paper of the Day
+**{paper['title']}**  
+[arXiv:{paper['id']}]({paper['link']})
+
+Key takeaways:
+- Finding 1
+- Finding 2
+- Potential application
+
+"""
+        
+        content = f"""# Learning Journal - {today}
+
+{paper_section}
+
+## 💡 Concepts Explored
+- Concept 1: Brief explanation
+- Concept 2: Brief explanation
+
+## 💻 Code Snippet
+```python
+# Today's learning in code
+def example_function():
+    pass
+```
+
+## 🔗 Resources
+- [Resource 1](#)
+- [Resource 2](#)
+
+## ✅ Tomorrow's Goals
+- [ ] Goal 1
+- [ ] Goal 2
+
+---
+*Keep learning, keep building!*
+"""
+        
+        try:
+            repo.create_file(file_path, f"Daily learning: {today}", content)
+            print(f"✅ Created learning journal for {today}")
+        except Exception as e:
+            print(f"Note: {e}")
+    
+    def run_daily_activity(self):
+        """Comprehensive daily automation routine"""
+        print(f"\n{'='*60}")
+        print(f"🤖 GitHub Activity Bot - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(f"{'='*60}\n")
+        
+        # 1. Daily learning commit
+        print("📝 Creating daily learning journal...")
+        self.create_daily_learning_commit()
+        
+        # 2. Update arXiv reading list (every day)
+        print("\n📚 Updating arXiv reading list...")
+        self.create_arxiv_reading_list()
+        
+        # 3. Find trending repos (every 3 days)
+        if datetime.now().day % 3 == 0:
+            print("\n🔥 Finding trending repositories...")
+            trending = self.find_trending_repos(max_results=3)
+            for repo in trending:
+                print(f"  ⭐ {repo['name']} ({repo['stars']} stars)")
+        
+        # 4. Create Kaggle project (every Sunday)
+        if datetime.now().weekday() == 6:  # Sunday
+            print("\n🏆 Creating weekly Kaggle project...")
+            datasets = self.fetch_kaggle_datasets()
+            if datasets:
+                self.create_kaggle_project_template(datasets[0]['title'])
+        
+        print(f"\n{'='*60}")
+        print("✅ Daily activity complete!")
+        print(f"{'='*60}\n")
+
+
+# GitHub Actions Workflow - ENHANCED
+GITHUB_ACTIONS_WORKFLOW = """
+name: Automated ML GitHub Activity
+
+on:
+  schedule:
+    - cron: '0 10 * * *'  # Daily at 10 AM UTC
+  workflow_dispatch:
+
+jobs:
+  maintain-activity:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install PyGithub requests feedparser kaggle schedule
+    
+    - name: Run activity bot
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      run: |
+        python github_activity_bot.py
+"""
+
+
+if __name__ == "__main__":
+    # Configuration
+    GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+    KAGGLE_USERNAME = os.getenv('KAGGLE_USERNAME')
+    KAGGLE_KEY = os.getenv('KAGGLE_KEY')
+    
+    if not GITHUB_TOKEN:
+        print("❌ Please set GITHUB_TOKEN environment variable")
+        exit(1)
+    
+    # Initialize bot
+    bot = GitHubActivityBot(
+        github_token=GITHUB_TOKEN,
+        kaggle_username=KAGGLE_USERNAME,
+        kaggle_key=KAGGLE_KEY
+    )
+    
+    # Run daily activity
+    bot.run_daily_activity()
+    
+    # Examples of manual operations:
+    # bot.create_arxiv_reading_list()
+    # bot.create_kaggle_project_template("house-prices", "competition")
+    # bot.create_ml_project_from_template("transformer-implementation", "research")
